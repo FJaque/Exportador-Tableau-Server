@@ -143,7 +143,7 @@ def intentar(descripcion, sitio, funcion, por_defecto=None):
     try:
         return funcion()
     except Exception as e:
-        log.warning(f"   ⚠ No se pudo obtener {descripcion}: {e}")
+        log.warning(f"   ⚠ No se pudo obtener {descripcion}: {texto_error(e)}")
         registrar_pendiente(sitio, "Inventario", "", descripcion, "", "", e,
                             "Revisar permisos del token (se requiere rol Administrador de sitio/servidor).")
         return por_defecto
@@ -363,7 +363,7 @@ def campos_por_hoja(conexion, workbooks, rutas):
             errores_seguidos = 0
         except Exception as e:
             errores_seguidos += 1
-            log.warning(f"   ⚠ Error leyendo campos de '{wb.name}': {e}")
+            log.warning(f"   ⚠ Error leyendo campos de '{wb.name}': {texto_error(e)}")
             registrar_pendiente(conexion.sitio, "Inventario campos", rutas.get(wb.project_id, ""), wb.name, wb.id,
                                 wb.webpage_url, e,
                                 "Verificar que la Metadata API esté habilitada "
