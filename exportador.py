@@ -94,7 +94,7 @@ def leer_config(ruta):
     if not os.path.exists(ruta):
         sys.exit(f"No se encontró el archivo de configuración '{ruta}'")
     cfg = configparser.ConfigParser()
-    cfg.read(ruta, encoding="utf-8")
+    cfg.read(ruta, encoding="utf-8-sig")
     return cfg
 
 
