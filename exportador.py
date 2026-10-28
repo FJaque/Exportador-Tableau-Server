@@ -7,11 +7,15 @@ Descarga a una carpeta local el contenido de uno o más sitios de Tableau:
   - Fuentes de datos publicadas (.tdsx / .tds)
   - Flujos de Prep (.tflx / .tfl)
 
-Además genera:
-  - inventario_<fecha>.xlsx : inventario completo del sitio (proyectos, workbooks, vistas,
-                              fuentes, conexiones, flujos, usuarios, grupos, tareas,
-                              suscripciones y campos por hoja como en el proyecto Copec)
-  - pendientes_<fecha>.csv  : todo lo que NO se pudo descargar, con su URL y la acción sugerida
+Flujo:
+  Fase 1 - Inventario: lista todo el contenido y genera inventario_<fecha>.xlsx antes de descargar
+           (proyectos, workbooks, vistas, fuentes, conexiones, flujos, usuarios, grupos, tareas,
+           suscripciones y campos por hoja como en el proyecto Copec).
+  Fase 2 - Descarga: baja los archivos y actualiza en el inventario el estado de cada elemento.
+
+Salidas:
+  - inventario_<fecha>.xlsx : inventario completo con la paleta de colores Backspace
+  - pendientes_<fecha>.xlsx : todo lo que NO se pudo descargar, con su URL y la acción sugerida
                               para hacerlo manualmente
   - logs/ejecucion_<fecha>.log
 
@@ -19,11 +23,11 @@ Uso:
     python exportador.py                    (usa config.ini)
     python exportador.py --config otro.ini
     python exportador.py --solo-inventario  (no descarga archivos)
+    python exportador.py --prueba           (modo prueba: solo 5 elementos por tipo)
 """
 
 import argparse
 import configparser
-import csv
 import getpass
 import logging
 import os
@@ -274,14 +278,14 @@ def borrar_temporales(temporal, tipo):
             os.remove(temporal + ext)
 
 
-def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas, opciones):
+def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas_items, opciones):
     """Descarga una lista de workbooks/fuentes/flujos y retorna {id: (estado, archivo)}."""
     resultados = {}
     carpeta_tipo = os.path.join(carpeta_sitio, CARPETAS[tipo])
     total = len(items)
 
     for i, item in enumerate(items, 1):
-        proyecto = rutas.get(item.project_id, "Espacio personal")
+        proyecto = rutas_items[item.id]
         inicio = time.time()
         try:
             estado, archivo = descargar(conexion, tipo, item, carpeta_tipo, proyecto, opciones)
@@ -296,6 +300,28 @@ def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas, opciones):
         resultados[item.id] = (estado, archivo)
 
     return resultados
+
+
+def seleccionar_prueba(items, rutas_items, cantidad):
+    """Modo prueba: toma los N elementos más livianos, priorizando los que no están en espacios personales."""
+    def orden(item):
+        personal = rutas_items[item.id].startswith("Espacio personal")
+        return personal, getattr(item, "size", None) or 0
+    return sorted(items, key=orden)[:cantidad]
+
+
+def descargar_sitio(conexion, sitio_info, opciones):
+    """Fase 2: descarga los archivos de un sitio ya inventariado."""
+    contenido, rutas_items = sitio_info["contenido"], sitio_info["rutas_items"]
+    descargas = {}
+    for tipo, opcion in (("Workbook", "descargar_workbooks"), ("Fuente de datos", "descargar_fuentes"),
+                         ("Flujo", "descargar_flujos")):
+        items = sitio_info["seleccion"][tipo]
+        if not opciones[opcion] or not items:
+            continue
+        log.info(f"⬇  Descargando {len(items)} de {len(contenido[tipo])} {CARPETAS[tipo].lower()}...")
+        descargas.update(descargar_lista(conexion, tipo, items, sitio_info["carpeta"], rutas_items, opciones))
+    return descargas
 
 
 # ---------------------- #
@@ -321,7 +347,7 @@ def filtrar_por_proyecto(items, rutas, filtro):
     return [i for i in items if rutas.get(i.project_id, "").split("/")[0] in filtro]
 
 
-def campos_por_hoja(conexion, workbooks, rutas):
+def campos_por_hoja(conexion, workbooks, rutas_items):
     """Inventario de campos usados en cada hoja (mismo formato que el proyecto Copec)."""
     registros = []
     errores_seguidos = 0
@@ -350,7 +376,7 @@ def campos_por_hoja(conexion, workbooks, rutas):
                             data_type = campo.get("dataType")
                         registros.append({
                             "site_name": conexion.sitio or "Default",
-                            "project": rutas.get(wb.project_id, "Espacio personal"),
+                            "project": rutas_items[wb.id],
                             "workbook_name": wb_meta.get("name"),
                             "workbook_id": wb_meta.get("luid"),
                             "sheet_name": hoja.get("name"),
@@ -364,7 +390,7 @@ def campos_por_hoja(conexion, workbooks, rutas):
         except Exception as e:
             errores_seguidos += 1
             log.warning(f"   ⚠ Error leyendo campos de '{wb.name}': {texto_error(e)}")
-            registrar_pendiente(conexion.sitio, "Inventario campos", rutas.get(wb.project_id, ""), wb.name, wb.id,
+            registrar_pendiente(conexion.sitio, "Inventario campos", rutas_items[wb.id], wb.name, wb.id,
                                 wb.webpage_url, e,
                                 "Verificar que la Metadata API esté habilitada "
                                 "(tsm maintenance metadata-services enable) y que el token vea el workbook.")
@@ -374,12 +400,13 @@ def campos_por_hoja(conexion, workbooks, rutas):
     return registros
 
 
-def inventario_sitio(conexion, opciones, carpeta_sitio, solo_inventario):
-    """Lista todo el contenido del sitio, descarga archivos y retorna las tablas del inventario."""
+def leer_inventario(conexion, opciones):
+    """Fase 1: lista todo el contenido del sitio y arma las tablas del inventario (sin descargar nada)."""
     server = conexion.server
     sitio = conexion.sitio
     nombre_sitio = sitio or "Default"
     filtro = opciones["filtro_proyectos"]
+    prueba = opciones["modo_prueba"]
     tablas = {}
 
     log.info("📂 Leyendo proyectos, usuarios y grupos...")
@@ -409,7 +436,7 @@ def inventario_sitio(conexion, opciones, carpeta_sitio, solo_inventario):
         })
         tablas["Usuarios por grupo"] += [{"sitio": nombre_sitio, "grupo": g.name, "usuario": u.name} for u in miembros]
 
-    # --- Workbooks, vistas y fuentes de datos ---
+    # --- Workbooks, vistas, fuentes de datos y flujos ---
     log.info("📚 Leyendo workbooks, vistas, fuentes de datos y flujos...")
     workbooks = filtrar_por_proyecto(listar(server.workbooks), rutas, filtro)
     fuentes = filtrar_por_proyecto(listar(server.datasources), rutas, filtro)
@@ -422,65 +449,68 @@ def inventario_sitio(conexion, opciones, carpeta_sitio, solo_inventario):
     log.info(f"   {len(proyectos)} proyectos | {len(workbooks)} workbooks | {len(vistas)} vistas | "
              f"{len(fuentes)} fuentes | {len(flujos)} flujos | {len(usuarios)} usuarios")
 
-    # --- Descargas ---
-    descargas = {}
-    if not solo_inventario:
-        if opciones["descargar_workbooks"]:
-            log.info(f"⬇  Descargando {len(workbooks)} workbooks...")
-            descargas.update(descargar_lista(conexion, "Workbook", workbooks, carpeta_sitio, rutas, opciones))
-        if opciones["descargar_fuentes"]:
-            log.info(f"⬇  Descargando {len(fuentes)} fuentes de datos...")
-            descargas.update(descargar_lista(conexion, "Fuente de datos", fuentes, carpeta_sitio, rutas, opciones))
-        if opciones["descargar_flujos"] and flujos:
-            log.info(f"⬇  Descargando {len(flujos)} flujos...")
-            descargas.update(descargar_lista(conexion, "Flujo", flujos, carpeta_sitio, rutas, opciones))
+    # Ruta de cada elemento. Los espacios personales se separan por propietario para no mezclar archivos.
+    rutas_items = {}
+    for item in workbooks + fuentes + flujos:
+        rutas_items[item.id] = rutas.get(item.project_id) or \
+            f"Espacio personal/{nombre_usuario.get(item.owner_id, item.owner_id)}"
+
+    contenido = {"Workbook": workbooks, "Fuente de datos": fuentes, "Flujo": flujos}
+    if prueba:
+        seleccion = {tipo: seleccionar_prueba(items, rutas_items, opciones["cantidad_prueba"])
+                     for tipo, items in contenido.items()}
+        log.info(f"🧪 Modo prueba: se procesan {opciones['cantidad_prueba']} elementos por tipo")
+    else:
+        seleccion = contenido
+    ids_seleccion = {i.id for items in seleccion.values() for i in items}
+    estado_inicial = "Pendiente de descarga"
 
     def estado(item_id):
-        return descargas.get(item_id, ("No descargado", ""))
+        return estado_inicial if item_id in ids_seleccion else "No incluido (modo prueba)"
 
     # --- Tablas de contenido ---
     log.info("🔌 Leyendo conexiones de workbooks y fuentes...")
     tablas["Workbooks"], tablas["Fuentes de datos"], tablas["Conexiones"] = [], [], []
     for wb in workbooks:
         tablas["Workbooks"].append({
-            "sitio": nombre_sitio, "id": wb.id, "nombre": wb.name,
-            "proyecto": rutas.get(wb.project_id, "Espacio personal"),
+            "sitio": nombre_sitio, "id": wb.id, "nombre": wb.name, "proyecto": rutas_items[wb.id],
             "propietario": nombre_usuario.get(wb.owner_id, wb.owner_id), "creado": fecha(wb.created_at),
             "actualizado": fecha(wb.updated_at), "tamano": wb.size, "mostrar_pestanas": wb.show_tabs,
             "descripcion": wb.description, "etiquetas": ", ".join(sorted(wb.tags or [])),
-            "url_web": wb.webpage_url, "estado_descarga": estado(wb.id)[0], "archivo_local": estado(wb.id)[1],
+            "url_web": wb.webpage_url, "estado_descarga": estado(wb.id), "archivo_local": "",
         })
-        conexiones = intentar(f"conexiones del workbook {wb.name}", sitio,
-                              lambda: server.workbooks.populate_connections(wb) or wb.connections, [])
-        tablas["Conexiones"] += filas_conexiones(nombre_sitio, "Workbook", wb, rutas, conexiones)
+        if wb.id in ids_seleccion:
+            conexiones = intentar(f"conexiones del workbook {wb.name}", sitio,
+                                  lambda: server.workbooks.populate_connections(wb) or wb.connections, [])
+            tablas["Conexiones"] += filas_conexiones(nombre_sitio, "Workbook", wb, rutas_items, conexiones)
 
     for ds in fuentes:
         tablas["Fuentes de datos"].append({
-            "sitio": nombre_sitio, "id": ds.id, "nombre": ds.name,
-            "proyecto": rutas.get(ds.project_id, "Espacio personal"),
+            "sitio": nombre_sitio, "id": ds.id, "nombre": ds.name, "proyecto": rutas_items[ds.id],
             "propietario": nombre_usuario.get(ds.owner_id, ds.owner_id), "tipo": ds.datasource_type,
             "tiene_extracto": ds.has_extracts, "certificada": ds.certified, "creado": fecha(ds.created_at),
             "actualizado": fecha(ds.updated_at), "descripcion": ds.description,
             "etiquetas": ", ".join(sorted(ds.tags or [])), "url_web": ds.webpage_url,
-            "estado_descarga": estado(ds.id)[0], "archivo_local": estado(ds.id)[1],
+            "estado_descarga": estado(ds.id), "archivo_local": "",
         })
-        conexiones = intentar(f"conexiones de la fuente {ds.name}", sitio,
-                              lambda: server.datasources.populate_connections(ds) or ds.connections, [])
-        tablas["Conexiones"] += filas_conexiones(nombre_sitio, "Fuente de datos", ds, rutas, conexiones)
+        if ds.id in ids_seleccion:
+            conexiones = intentar(f"conexiones de la fuente {ds.name}", sitio,
+                                  lambda: server.datasources.populate_connections(ds) or ds.connections, [])
+            tablas["Conexiones"] += filas_conexiones(nombre_sitio, "Fuente de datos", ds, rutas_items, conexiones)
 
     tablas["Vistas"] = [{
         "sitio": nombre_sitio, "id": v.id, "nombre": v.name, "workbook": ids_wb[v.workbook_id].name,
-        "proyecto": rutas.get(ids_wb[v.workbook_id].project_id, "Espacio personal"),
+        "proyecto": rutas_items[v.workbook_id],
         "propietario": nombre_usuario.get(v.owner_id, v.owner_id), "tipo_hoja": getattr(v, "sheet_type", None),
         "total_visitas": getattr(v, "_total_views", None),
         "creado": fecha(v.created_at), "actualizado": fecha(v.updated_at), "url_web": conexion.url_vista(v.content_url),
     } for v in vistas]
 
     tablas["Flujos"] = [{
-        "sitio": nombre_sitio, "id": f.id, "nombre": f.name, "proyecto": rutas.get(f.project_id, "Espacio personal"),
+        "sitio": nombre_sitio, "id": f.id, "nombre": f.name, "proyecto": rutas_items[f.id],
         "propietario": nombre_usuario.get(f.owner_id, f.owner_id), "creado": fecha(f.created_at),
         "actualizado": fecha(f.updated_at), "descripcion": f.description, "url_web": f.webpage_url,
-        "estado_descarga": estado(f.id)[0], "archivo_local": estado(f.id)[1],
+        "estado_descarga": estado(f.id), "archivo_local": "",
     } for f in flujos]
 
     # --- Tareas y suscripciones ---
@@ -504,19 +534,31 @@ def inventario_sitio(conexion, opciones, carpeta_sitio, solo_inventario):
 
     # --- Campos por hoja (inventario Copec) ---
     tablas["Campos"] = []
-    if opciones["inventario_campos"] and workbooks:
+    if opciones["inventario_campos"] and seleccion["Workbook"]:
         log.info("🧬 Leyendo campos por hoja desde la Metadata API...")
-        tablas["Campos"] = campos_por_hoja(conexion, workbooks, rutas)
+        tablas["Campos"] = campos_por_hoja(conexion, seleccion["Workbook"], rutas_items)
 
     tablas["_resumen"] = {
         "sitio": nombre_sitio, "proyectos": len(tablas["Proyectos"]), "workbooks": len(workbooks),
         "vistas": len(vistas), "fuentes_de_datos": len(fuentes), "flujos": len(flujos),
         "usuarios": len(usuarios), "grupos": len(grupos),
-        "descargados": sum(1 for e, _ in descargas.values() if e == "Descargado"),
-        "ya_existian": sum(1 for e, _ in descargas.values() if e == "Ya existía"),
-        "con_error": sum(1 for e, _ in descargas.values() if e == "Error"),
+        "descargados": 0, "ya_existian": 0, "con_error": 0,
     }
-    return tablas
+    return {"sitio": sitio, "tablas": tablas, "contenido": contenido, "seleccion": seleccion,
+            "rutas_items": rutas_items}
+
+
+def aplicar_descargas(tablas, descargas, solo_inventario):
+    """Actualiza en el inventario el estado de descarga de cada elemento."""
+    for hoja in ("Workbooks", "Fuentes de datos", "Flujos"):
+        for fila in tablas[hoja]:
+            if fila["id"] in descargas:
+                fila["estado_descarga"], fila["archivo_local"] = descargas[fila["id"]]
+            elif solo_inventario and fila["estado_descarga"] == "Pendiente de descarga":
+                fila["estado_descarga"] = "No descargado (solo inventario)"
+    estados = [e for e, _ in descargas.values()]
+    tablas["_resumen"].update(descargados=estados.count("Descargado"), ya_existian=estados.count("Ya existía"),
+                              con_error=estados.count("Error"))
 
 
 def _miembros_grupo(server, grupo):
@@ -524,10 +566,10 @@ def _miembros_grupo(server, grupo):
     return list(grupo.users)
 
 
-def filas_conexiones(sitio, tipo, item, rutas, conexiones):
+def filas_conexiones(sitio, tipo, item, rutas_items, conexiones):
     return [{
         "sitio": sitio, "tipo_contenido": tipo, "contenido": item.name,
-        "proyecto": rutas.get(item.project_id, "Espacio personal"), "id_conexion": c.id,
+        "proyecto": rutas_items[item.id], "id_conexion": c.id,
         "tipo_conexion": c.connection_type, "servidor": c.server_address, "puerto": c.server_port,
         "usuario_bd": c.username, "password_embebida": c.embed_password,
         "fuente_datos": getattr(c, "datasource_name", None),
@@ -549,51 +591,146 @@ def describir_programacion(programacion):
 
 
 # ---------------------- #
-#        SALIDAS         #
+#     SALIDAS (EXCEL)    #
 # ---------------------- #
 
-ORDEN_HOJAS = ["Proyectos", "Workbooks", "Vistas", "Fuentes de datos", "Conexiones", "Flujos", "Campos",
-               "Usuarios", "Grupos", "Usuarios por grupo", "Tareas extraccion", "Suscripciones"]
+# Paleta Backspace (tomada de backspace.cl)
+NEGRO = "313131"
+VERDE = "99CC33"
+LIMA = "AEEE2F"
+GRIS = "838080"
+CLARO = "EEEEEE"
+ROJO = "EF4444"
+
+COLOR_ESTADO = {    # relleno, color de letra
+    "Descargado": ("F0FAE0", "4D6B12"),
+    "Ya existía": ("F0FAE0", "4D6B12"),
+    "Error": ("FEE2E2", "991B1B"),
+    "Pendiente de descarga": ("FFFBEB", "8A6D1A"),
+}
+
+HOJAS_CONTENIDO = ["Proyectos", "Workbooks", "Vistas", "Fuentes de datos", "Conexiones", "Flujos", "Campos"]
+HOJAS_ADMIN = ["Usuarios", "Grupos", "Usuarios por grupo", "Tareas extraccion", "Suscripciones"]
 
 
-def guardar_inventario(inventarios, info, ruta):
-    with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
-        resumen = pd.DataFrame([inv["_resumen"] for inv in inventarios])
-        encabezado = pd.DataFrame(list(info.items()), columns=["dato", "valor"])
-        encabezado.to_excel(writer, sheet_name="Resumen", index=False)
-        resumen.to_excel(writer, sheet_name="Resumen", index=False, startrow=len(encabezado) + 2)
-
-        for hoja in ORDEN_HOJAS:
-            filas = [f for inv in inventarios for f in inv.get(hoja, [])]
-            escribir_hoja(writer, hoja, pd.DataFrame(filas))
-        escribir_hoja(writer, "Pendientes", pd.DataFrame(pendientes))
-
-        for ws in writer.book.worksheets:
-            ajustar_columnas(ws)
+def guardar_excel(ruta, funcion):
+    """Guarda un Excel; si el archivo está abierto (típico en reuniones) lo guarda con otro nombre."""
+    try:
+        funcion(ruta)
+        return ruta
+    except PermissionError:
+        alternativa = ruta.replace(".xlsx", f"_{datetime.now():%H%M%S}.xlsx")
+        log.warning(f"   ⚠ '{os.path.basename(ruta)}' está abierto en Excel; se guarda como '{os.path.basename(alternativa)}'")
+        funcion(alternativa)
+        return alternativa
 
 
-def escribir_hoja(writer, nombre, df):
+def guardar_inventario(sitios_info, info, ruta):
+    def escribir(destino):
+        with pd.ExcelWriter(destino, engine="openpyxl") as writer:
+            resumen = pd.DataFrame([s["tablas"]["_resumen"] for s in sitios_info])
+            escribir_resumen(writer, "Inventario Tableau", info, resumen)
+            for hoja in HOJAS_CONTENIDO + HOJAS_ADMIN:
+                filas = [f for s in sitios_info for f in s["tablas"].get(hoja, [])]
+                escribir_hoja(writer, hoja, pd.DataFrame(filas), VERDE if hoja in HOJAS_CONTENIDO else GRIS)
+            escribir_hoja(writer, "Pendientes", tabla_pendientes(), ROJO)
+    return guardar_excel(ruta, escribir)
+
+
+def guardar_pendientes(info, ruta):
+    def escribir(destino):
+        df = tabla_pendientes()
+        with pd.ExcelWriter(destino, engine="openpyxl") as writer:
+            if pendientes:
+                resumen = (df.groupby(["sitio", "tipo", "accion_sugerida"]).size()
+                           .reset_index(name="cantidad").sort_values("cantidad", ascending=False))
+            else:
+                resumen = pd.DataFrame({"resultado": ["No hay elementos pendientes 🎉"]})
+            escribir_resumen(writer, "Pendientes de descarga manual", info, resumen)
+            escribir_hoja(writer, "Pendientes", df, ROJO)
+    return guardar_excel(ruta, escribir)
+
+
+def tabla_pendientes():
+    columnas = ["fecha", "sitio", "tipo", "proyecto", "nombre", "id", "url_web", "error", "accion_sugerida"]
+    return pd.DataFrame(pendientes, columns=columnas)
+
+
+def escribir_resumen(writer, titulo, info, tabla):
+    """Hoja de portada: título con la paleta Backspace, datos de la ejecución y tabla resumen."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    fila_tabla = len(info) + 5
+    limpiar_df(tabla).to_excel(writer, sheet_name="Resumen", index=False, startrow=fila_tabla - 1)
+    ws = writer.sheets["Resumen"]
+    ws.sheet_properties.tabColor = NEGRO
+    ws.sheet_view.showGridLines = False
+
+    ancho = max(len(tabla.columns), 2)
+    for col in range(1, ancho + 1):
+        ws.cell(row=1, column=col).fill = PatternFill("solid", fgColor=NEGRO)
+        ws.cell(row=2, column=col).fill = PatternFill("solid", fgColor=VERDE)
+    ws.cell(row=1, column=1, value=titulo).font = Font(size=16, bold=True, color=LIMA)
+    ws.cell(row=1, column=1).alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 32
+    ws.row_dimensions[2].height = 4
+
+    for i, (dato, valor) in enumerate(info.items(), start=4):
+        ws.cell(row=i - 1, column=1, value=dato).font = Font(bold=True, color=NEGRO)
+        ws.cell(row=i - 1, column=2, value=valor).font = Font(color=GRIS)
+
+    estilo_encabezado(ws, fila_tabla)
+    ajustar_columnas(ws, desde_fila=fila_tabla)
+
+
+def escribir_hoja(writer, nombre, df, color_pestana):
+    from openpyxl.styles import Font, PatternFill
+
     if df.empty:
         df = pd.DataFrame({"sin datos": []})
-    df = df.apply(lambda col: col.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v))
-    df.to_excel(writer, sheet_name=nombre, index=False)
+    limpiar_df(df).to_excel(writer, sheet_name=nombre, index=False)
     ws = writer.sheets[nombre]
+    ws.sheet_properties.tabColor = color_pestana
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+    estilo_encabezado(ws, 1)
+
+    columnas = {c.value: c.column for c in ws[1]}
+    if "estado_descarga" in columnas:
+        for (celda,) in ws.iter_rows(min_row=2, min_col=columnas["estado_descarga"], max_col=columnas["estado_descarga"]):
+            if celda.value in COLOR_ESTADO:
+                relleno, letra = COLOR_ESTADO[celda.value]
+                celda.fill = PatternFill("solid", fgColor=relleno)
+                celda.font = Font(color=letra, bold=True)
+    if "url_web" in columnas and ws.max_row < 20000:
+        for (celda,) in ws.iter_rows(min_row=2, min_col=columnas["url_web"], max_col=columnas["url_web"]):
+            if celda.value:
+                celda.hyperlink = celda.value
+                celda.font = Font(color="4D6B12", underline="single")
+    ajustar_columnas(ws)
 
 
-def ajustar_columnas(ws):
-    for columna in ws.columns:
-        largo = max((len(str(c.value)) for c in list(columna)[:200] if c.value is not None), default=8)
+def estilo_encabezado(ws, fila):
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    for celda in ws[fila]:
+        if celda.value is None:
+            continue
+        celda.fill = PatternFill("solid", fgColor=NEGRO)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.alignment = Alignment(vertical="center")
+        celda.border = Border(bottom=Side(style="medium", color=VERDE))
+    ws.row_dimensions[fila].height = 22
+
+
+def limpiar_df(df):
+    return df.apply(lambda col: col.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v))
+
+
+def ajustar_columnas(ws, desde_fila=1):
+    for columna in ws.iter_cols(min_row=desde_fila, max_row=min(ws.max_row, desde_fila + 200)):
+        largo = max((len(str(c.value)) for c in columna if c.value is not None), default=8)
         ws.column_dimensions[columna[0].column_letter].width = min(max(largo + 2, 10), 60)
-
-
-def guardar_pendientes(ruta):
-    columnas = ["fecha", "sitio", "tipo", "proyecto", "nombre", "id", "url_web", "error", "accion_sugerida"]
-    with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
-        escritor = csv.DictWriter(f, fieldnames=columnas, delimiter=";")
-        escritor.writeheader()
-        escritor.writerows(pendientes)
 
 
 # ---------------------- #
@@ -604,6 +741,8 @@ def main():
     parser = argparse.ArgumentParser(description="Exporta el contenido de Tableau Server / Cloud a una carpeta local.")
     parser.add_argument("--config", default="config.ini", help="Archivo de configuración (por defecto config.ini)")
     parser.add_argument("--solo-inventario", action="store_true", help="Genera solo el inventario, sin descargar")
+    parser.add_argument("--prueba", action="store_true",
+                        help="Modo prueba: procesa solo unos pocos elementos por tipo (cantidad_prueba en config)")
     args = parser.parse_args()
 
     cfg = leer_config(args.config)
@@ -616,6 +755,8 @@ def main():
         "sobrescribir": e.getboolean("sobrescribir", False),
         "inventario_campos": e.getboolean("inventario_campos", True),
         "filtro_proyectos": [p.strip() for p in e.get("filtro_proyectos", "").split(",") if p.strip()],
+        "modo_prueba": args.prueba or e.getboolean("modo_prueba", False),
+        "cantidad_prueba": e.getint("cantidad_prueba", 5),
     }
 
     marca = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -625,15 +766,30 @@ def main():
 
     token_name = t.get("token_name") or os.environ.get("TABLEAU_TOKEN_NAME") or input("Nombre del token (PAT): ").strip()
     token_value = t.get("token_value") or os.environ.get("TABLEAU_TOKEN_VALUE") or getpass.getpass("Valor del token (PAT): ").strip()
-    sitios = [s.strip() for s in t.get("sites", "").split(",")] or [""]
+    sitios = [s.strip() for s in t.get("sites", "").split(",")]
 
+    modo = "Solo inventario" if args.solo_inventario else "Inventario + descarga"
+    if opciones["modo_prueba"]:
+        modo += f" | PRUEBA ({opciones['cantidad_prueba']} por tipo)"
     log.info("=" * 70)
     log.info(f"Exportador Tableau | {t['server_url']} | sitios: {', '.join(s or 'Default' for s in sitios)}")
+    log.info(f"Modo: {modo}")
     log.info(f"Carpeta de salida: {carpeta}")
     log.info("=" * 70)
 
     conexion = Conexion(t["server_url"], token_name, token_value, t.getboolean("verify_ssl", True))
-    inventarios = []
+    sitios_info = []
+    ruta_inventario = os.path.join(carpeta, f"inventario_{marca}.xlsx")
+    ruta_pendientes = os.path.join(carpeta, f"pendientes_{marca}.xlsx")
+
+    def info_ejecucion():
+        minutos, segundos = divmod(int(time.time() - inicio), 60)
+        return {
+            "Servidor": t["server_url"], "Fecha de extracción": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Modo": modo, "Versión API": conexion.server.version, "Duración": f"{minutos:02d}:{segundos:02d}",
+            "Incluye extractos": "Sí" if opciones["incluir_extractos"] else "No",
+            "Elementos pendientes": len(pendientes),
+        }
 
     try:
         if sitios == ["*"]:
@@ -641,53 +797,62 @@ def main():
             sitios = [s.content_url for s in listar(conexion.server.sites)]
             log.info(f"Sitios encontrados: {', '.join(s or 'Default' for s in sitios)}")
 
+        # ---- Fase 1: inventario de todos los sitios ----
+        log.info("\n📋 FASE 1: INVENTARIO")
         for sitio in sitios:
-            log.info(f"\n🔨 Procesando sitio: {sitio or 'Default'}")
+            log.info(f"\n🔨 Inventariando sitio: {sitio or 'Default'}")
             try:
                 conexion.conectar(sitio)
+                info_sitio = leer_inventario(conexion, opciones)
+                info_sitio["carpeta"] = os.path.join(carpeta, limpiar_nombre(sitio or "Default"))
+                sitios_info.append(info_sitio)
             except Exception as ex:
-                log.error(f"   🚨 No se pudo iniciar sesión en el sitio '{sitio or 'Default'}': {ex}")
+                log.exception(f"   🚨 Error inventariando el sitio '{sitio or 'Default'}': {ex}")
                 registrar_pendiente(sitio, "Sitio", "", sitio or "Default", "", t["server_url"], ex,
-                                    "Revisar nombre del sitio y que el token pertenezca a ese sitio.")
-                continue
-            try:
-                carpeta_sitio = os.path.join(carpeta, limpiar_nombre(sitio or "Default"))
-                inventarios.append(inventario_sitio(conexion, opciones, carpeta_sitio, args.solo_inventario))
-            except Exception as ex:
-                log.exception(f"   🚨 Error procesando el sitio '{sitio or 'Default'}': {ex}")
-                registrar_pendiente(sitio, "Sitio", "", sitio or "Default", "", t["server_url"], ex,
-                                    "Revisar el log y re-ejecutar; los archivos ya descargados se saltan.")
+                                    "Revisar nombre del sitio, que el token pertenezca a ese sitio y re-ejecutar.")
+
+        ruta_inventario = guardar_inventario(sitios_info, info_ejecucion(), ruta_inventario)
+        log.info(f"\n📊 Inventario guardado: {ruta_inventario}")
+
+        # ---- Fase 2: descarga ----
+        if not args.solo_inventario:
+            log.info("\n⬇  FASE 2: DESCARGA")
+            for info_sitio in sitios_info:
+                sitio = info_sitio["sitio"]
+                log.info(f"\n🔨 Descargando sitio: {sitio or 'Default'}")
+                try:
+                    conexion.conectar(sitio)
+                    descargas = descargar_sitio(conexion, info_sitio, opciones)
+                    aplicar_descargas(info_sitio["tablas"], descargas, False)
+                except Exception as ex:
+                    log.exception(f"   🚨 Error descargando el sitio '{sitio or 'Default'}': {ex}")
+                    registrar_pendiente(sitio, "Sitio", "", sitio or "Default", "", t["server_url"], ex,
+                                        "Revisar el log y re-ejecutar; los archivos ya descargados se saltan.")
+        else:
+            for info_sitio in sitios_info:
+                aplicar_descargas(info_sitio["tablas"], {}, True)
 
     except KeyboardInterrupt:
         log.warning("\n⛔ Ejecución interrumpida por el usuario. Se guarda lo obtenido hasta ahora.")
     finally:
         conexion.desconectar()
-        minutos, segundos = divmod(int(time.time() - inicio), 60)
-
-        ruta_pendientes = os.path.join(carpeta, f"pendientes_{marca}.csv")
-        guardar_pendientes(ruta_pendientes)
-
-        ruta_inventario = os.path.join(carpeta, f"inventario_{marca}.xlsx")
-        info = {
-            "servidor": t["server_url"], "fecha_extraccion": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "version_api": conexion.server.version, "duracion": f"{minutos:02d}:{segundos:02d}",
-            "incluye_extractos": opciones["incluir_extractos"], "pendientes": len(pendientes),
-        }
+        info = info_ejecucion()
         try:
-            guardar_inventario(inventarios, info, ruta_inventario)
+            ruta_inventario = guardar_inventario(sitios_info, info, ruta_inventario)
+            ruta_pendientes = guardar_pendientes(info, ruta_pendientes)
         except Exception as ex:
-            log.exception(f"🚨 No se pudo guardar el inventario Excel: {ex}")
+            log.exception(f"🚨 No se pudieron guardar los Excel: {ex}")
 
         log.info("\n" + "=" * 70)
-        for inv in inventarios:
-            r = inv["_resumen"]
+        for s in sitios_info:
+            r = s["tablas"]["_resumen"]
             log.info(f"Sitio {r['sitio']}: {r['workbooks']} workbooks, {r['fuentes_de_datos']} fuentes, "
                      f"{r['flujos']} flujos | descargados {r['descargados']}, ya existían {r['ya_existian']}, "
                      f"con error {r['con_error']}")
         log.info(f"📊 Inventario : {ruta_inventario}")
         log.info(f"📝 Pendientes : {ruta_pendientes} ({len(pendientes)} elementos)")
         log.info(f"🗒  Log        : {ruta_log}")
-        log.info(f"⏱  Duración   : {minutos:02d}:{segundos:02d}")
+        log.info(f"⏱  Duración   : {info['Duración']}")
         log.info("=" * 70)
 
 

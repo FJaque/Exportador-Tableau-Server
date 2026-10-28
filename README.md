@@ -3,8 +3,12 @@
 Descarga a una carpeta local todo el contenido de uno o más sitios de Tableau y genera un inventario completo en Excel.
 
 ## 🚀 Qué hace
+El proceso corre en dos fases:
+1. **Inventario**: lista todo el contenido y guarda `inventario_<fecha>.xlsx` *antes* de descargar nada. Aunque la descarga se corte, el inventario ya queda disponible.
+2. **Descarga**: baja los archivos y vuelve a guardar el inventario con el estado de descarga de cada elemento.
+
 - Descarga **workbooks** (`.twbx`), **fuentes de datos publicadas** (`.tdsx`) y **flujos de Prep** (`.tflx`), respetando la estructura de proyectos.
-- Genera `inventario_<fecha>.xlsx` con las hojas:
+- Genera `inventario_<fecha>.xlsx` (con la paleta de colores Backspace) con las hojas:
   | Hoja | Contenido |
   |---|---|
   | Resumen | Servidor, fecha, versión API y totales por sitio |
@@ -18,7 +22,7 @@ Descarga a una carpeta local todo el contenido de uno o más sitios de Tableau y
   | Usuarios / Grupos / Usuarios por grupo | Roles, autenticación, último login, membresías |
   | Tareas extraccion / Suscripciones | Programaciones de actualización y suscripciones |
   | Pendientes | Lo que falta descargar o revisar a mano |
-- Genera `pendientes_<fecha>.csv` (separado por `;`, abre directo en Excel) con la **URL web** y la **acción sugerida** de cada elemento que no se pudo descargar, para hacerlo manualmente.
+- Genera `pendientes_<fecha>.xlsx` con un resumen por tipo/acción y el detalle de cada elemento que no se pudo descargar: **URL web** (clic directo) y **acción sugerida** para hacerlo manualmente.
 - Deja un log completo en `logs/ejecucion_<fecha>.log`.
 
 ## ⚙️ Requisitos
@@ -37,10 +41,17 @@ Descarga a una carpeta local todo el contenido de uno o más sitios de Tableau y
    o doble clic en `ejecutar.bat`.
    Opciones:
    ```
+   python exportador.py --prueba               # modo prueba: solo 5 elementos por tipo
    python exportador.py --solo-inventario      # solo el Excel, sin descargar archivos
    python exportador.py --config cliente.ini   # usar otra configuración
    ```
-3. Revisar `pendientes_<fecha>.csv` y descargar a mano lo que falte.
+3. Revisar `pendientes_<fecha>.xlsx` y descargar a mano lo que falte.
+
+### Modo prueba
+Con `--prueba` (o `modo_prueba = true` en `config.ini`) se descargan solo `cantidad_prueba` elementos por tipo (5 por defecto), priorizando los más livianos y fuera de espacios personales. El inventario lista todo el contenido, pero las conexiones y los campos solo se leen para esos elementos, así la prueba toma pocos minutos. Sirve para validar acceso, permisos y la estructura de carpetas en una reunión antes de lanzar la exportación completa.
+
+### Si el Excel está abierto
+Si `inventario_*.xlsx` o `pendientes_*.xlsx` están abiertos en Excel, el programa no falla: guarda una copia con la hora agregada al nombre.
 
 ### Re-ejecutar
 Con `sobrescribir = false` (por defecto), los archivos que ya están en la carpeta se saltan, así que si la ejecución se corta o hubo errores de red basta con volver a ejecutar: solo se descarga lo que falta. Las descargas se escriben primero como `*__descargando` y se renombran al terminar, por lo que nunca queda un archivo a medias con el nombre final.
@@ -50,10 +61,11 @@ Con `sobrescribir = false` (por defecto), los archivos que ya están en la carpe
 exportacion/
 ├── <sitio>/
 │   ├── Workbooks/<Proyecto>/<Subproyecto>/<workbook>.twbx
+│   ├── Workbooks/Espacio personal/<propietario>/<workbook>.twbx
 │   ├── Fuentes de datos/<Proyecto>/<fuente>.tdsx
 │   └── Flujos/<Proyecto>/<flujo>.tflx
 ├── inventario_<fecha>.xlsx
-├── pendientes_<fecha>.csv
+├── pendientes_<fecha>.xlsx
 └── logs/ejecucion_<fecha>.log
 ```
 
