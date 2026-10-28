@@ -278,17 +278,28 @@ def borrar_temporales(temporal, tipo):
             os.remove(temporal + ext)
 
 
-def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas_items, opciones):
-    """Descarga una lista de workbooks/fuentes/flujos y retorna {id: (estado, archivo)}."""
+def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas_items, opciones, meta_exitos=None):
+    """Descarga una lista de workbooks/fuentes/flujos y retorna {id: (estado, archivo)}.
+
+    Con meta_exitos (modo prueba) se detiene al lograr esa cantidad de descargas exitosas,
+    saltando a los siguientes elementos cuando uno falla (ej. por falta de permisos).
+    """
     resultados = {}
     carpeta_tipo = os.path.join(carpeta_sitio, CARPETAS[tipo])
+    if meta_exitos:
+        meta_exitos = min(meta_exitos, len(items))
+        items = items[:meta_exitos * 4]
     total = len(items)
+    exitos = 0
 
     for i, item in enumerate(items, 1):
+        if meta_exitos and exitos >= meta_exitos:
+            break
         proyecto = rutas_items[item.id]
         inicio = time.time()
         try:
             estado, archivo = descargar(conexion, tipo, item, carpeta_tipo, proyecto, opciones)
+            exitos += 1
             tamano = os.path.getsize(ruta_windows(archivo)) / 1024 / 1024
             log.info(f"   [{i}/{total}] {tipo} '{proyecto}/{item.name}' -> {estado} "
                      f"({tamano:.1f} MB, {time.time() - inicio:.0f}s)")
@@ -299,28 +310,37 @@ def descargar_lista(conexion, tipo, items, carpeta_sitio, rutas_items, opciones)
                                 getattr(item, "webpage_url", ""), e)
         resultados[item.id] = (estado, archivo)
 
+    if meta_exitos and exitos < meta_exitos:
+        log.warning(f"   ⚠ Modo prueba: solo {exitos} de {meta_exitos} {CARPETAS[tipo].lower()} se pudieron descargar "
+                    f"en {len(resultados)} intentos")
     return resultados
 
 
-def seleccionar_prueba(items, rutas_items, cantidad):
-    """Modo prueba: toma los N elementos más livianos, priorizando los que no están en espacios personales."""
+def ordenar_prueba(items, rutas_items):
+    """Modo prueba: ordena primero los elementos más livianos y fuera de espacios personales."""
     def orden(item):
         personal = rutas_items[item.id].startswith("Espacio personal")
         return personal, getattr(item, "size", None) or 0
-    return sorted(items, key=orden)[:cantidad]
+    return sorted(items, key=orden)
 
 
 def descargar_sitio(conexion, sitio_info, opciones):
     """Fase 2: descarga los archivos de un sitio ya inventariado."""
     contenido, rutas_items = sitio_info["contenido"], sitio_info["rutas_items"]
+    prueba = opciones["modo_prueba"]
     descargas = {}
     for tipo, opcion in (("Workbook", "descargar_workbooks"), ("Fuente de datos", "descargar_fuentes"),
                          ("Flujo", "descargar_flujos")):
-        items = sitio_info["seleccion"][tipo]
+        items = sitio_info["candidatos"][tipo] if prueba else contenido[tipo]
         if not opciones[opcion] or not items:
             continue
-        log.info(f"⬇  Descargando {len(items)} de {len(contenido[tipo])} {CARPETAS[tipo].lower()}...")
-        descargas.update(descargar_lista(conexion, tipo, items, sitio_info["carpeta"], rutas_items, opciones))
+        meta = opciones["cantidad_prueba"] if prueba else None
+        if prueba:
+            log.info(f"⬇  Modo prueba: buscando {min(meta, len(items))} descargas exitosas de "
+                     f"{len(items)} {CARPETAS[tipo].lower()}...")
+        else:
+            log.info(f"⬇  Descargando {len(items)} {CARPETAS[tipo].lower()}...")
+        descargas.update(descargar_lista(conexion, tipo, items, sitio_info["carpeta"], rutas_items, opciones, meta))
     return descargas
 
 
@@ -456,10 +476,11 @@ def leer_inventario(conexion, opciones):
             f"Espacio personal/{nombre_usuario.get(item.owner_id, item.owner_id)}"
 
     contenido = {"Workbook": workbooks, "Fuente de datos": fuentes, "Flujo": flujos}
+    # En modo prueba las conexiones y campos se leen solo para los primeros candidatos
+    candidatos = {tipo: ordenar_prueba(items, rutas_items) for tipo, items in contenido.items()}
     if prueba:
-        seleccion = {tipo: seleccionar_prueba(items, rutas_items, opciones["cantidad_prueba"])
-                     for tipo, items in contenido.items()}
-        log.info(f"🧪 Modo prueba: se procesan {opciones['cantidad_prueba']} elementos por tipo")
+        seleccion = {tipo: items[:opciones["cantidad_prueba"]] for tipo, items in candidatos.items()}
+        log.info(f"🧪 Modo prueba: se buscan {opciones['cantidad_prueba']} descargas exitosas por tipo")
     else:
         seleccion = contenido
     ids_seleccion = {i.id for items in seleccion.values() for i in items}
@@ -544,18 +565,18 @@ def leer_inventario(conexion, opciones):
         "usuarios": len(usuarios), "grupos": len(grupos),
         "descargados": 0, "ya_existian": 0, "con_error": 0,
     }
-    return {"sitio": sitio, "tablas": tablas, "contenido": contenido, "seleccion": seleccion,
+    return {"sitio": sitio, "tablas": tablas, "contenido": contenido, "candidatos": candidatos,
             "rutas_items": rutas_items}
 
 
-def aplicar_descargas(tablas, descargas, solo_inventario):
+def aplicar_descargas(tablas, descargas, texto_no_descargado):
     """Actualiza en el inventario el estado de descarga de cada elemento."""
     for hoja in ("Workbooks", "Fuentes de datos", "Flujos"):
         for fila in tablas[hoja]:
             if fila["id"] in descargas:
                 fila["estado_descarga"], fila["archivo_local"] = descargas[fila["id"]]
-            elif solo_inventario and fila["estado_descarga"] == "Pendiente de descarga":
-                fila["estado_descarga"] = "No descargado (solo inventario)"
+            elif fila["estado_descarga"] == "Pendiente de descarga":
+                fila["estado_descarga"] = texto_no_descargado
     estados = [e for e, _ in descargas.values()]
     tablas["_resumen"].update(descargados=estados.count("Descargado"), ya_existian=estados.count("Ya existía"),
                               con_error=estados.count("Error"))
@@ -804,7 +825,9 @@ def main():
             try:
                 conexion.conectar(sitio)
                 info_sitio = leer_inventario(conexion, opciones)
-                info_sitio["carpeta"] = os.path.join(carpeta, limpiar_nombre(sitio or "Default"))
+                # La prueba descarga en una carpeta aparte para no confundirse con archivos de ejecuciones anteriores
+                base = os.path.join(carpeta, "_prueba") if opciones["modo_prueba"] else carpeta
+                info_sitio["carpeta"] = os.path.join(base, limpiar_nombre(sitio or "Default"))
                 sitios_info.append(info_sitio)
             except Exception as ex:
                 log.exception(f"   🚨 Error inventariando el sitio '{sitio or 'Default'}': {ex}")
@@ -823,14 +846,15 @@ def main():
                 try:
                     conexion.conectar(sitio)
                     descargas = descargar_sitio(conexion, info_sitio, opciones)
-                    aplicar_descargas(info_sitio["tablas"], descargas, False)
+                    aplicar_descargas(info_sitio["tablas"], descargas,
+                                      "No incluido (modo prueba)" if opciones["modo_prueba"] else "No descargado")
                 except Exception as ex:
                     log.exception(f"   🚨 Error descargando el sitio '{sitio or 'Default'}': {ex}")
                     registrar_pendiente(sitio, "Sitio", "", sitio or "Default", "", t["server_url"], ex,
                                         "Revisar el log y re-ejecutar; los archivos ya descargados se saltan.")
         else:
             for info_sitio in sitios_info:
-                aplicar_descargas(info_sitio["tablas"], {}, True)
+                aplicar_descargas(info_sitio["tablas"], {}, "No descargado (solo inventario)")
 
     except KeyboardInterrupt:
         log.warning("\n⛔ Ejecución interrumpida por el usuario. Se guarda lo obtenido hasta ahora.")
