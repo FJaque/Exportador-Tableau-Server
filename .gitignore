@@ -1,0 +1,22 @@
+# Resultados de exportación (contienen datos de clientes)
+exportacion*/
+logs/
+*.twb
+*.twbx
+*.tds
+*.tdsx
+*.tfl
+*.tflx
+*.hyper
+inventario_*.xlsx
+pendientes_*.csv
+
+# Configuraciones por cliente (pueden contener tokens). Solo se versiona la plantilla.
+*.ini
+!config.ini
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
